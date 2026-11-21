@@ -21,14 +21,14 @@
   let lastPhase = null;
   let toastTimer = null;
 
-  // WASM + WebRTC P2P + BroadcastChannel state
+  // WASM + MQTT-over-WSS + BroadcastChannel state
   let wasm = null;
-  let peer = null;
+  let mqttClient = null;
   let bc = null;
   let isHostNode = false;
-  let hostConn = null;
+  let hostTransport = null; // "bc" | "mqtt"
   let guestJoinTimer = null;
-  const guestConns = new Map(); // playerId -> DataConnection | "bc"
+  const guestTransports = new Map(); // playerId -> "bc" | "mqtt"
 
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -120,6 +120,23 @@
     return JSON.parse(readWasmOut());
   }
 
+  function topicHost(code) {
+    return `matsya/sabha/${code}/host`;
+  }
+
+  function topicToPlayer(code, pid) {
+    return `matsya/sabha/${code}/to/${pid}`;
+  }
+
+  function sendToGuest(pid, payload) {
+    const transport = guestTransports.get(pid);
+    if (transport === "bc" && bc) {
+      bc.postMessage({ to: pid, ...payload });
+    } else if (mqttClient && mqttClient.connected) {
+      mqttClient.publish(topicToPlayer(roomCode, pid), JSON.stringify(payload), { qos: 1 });
+    }
+  }
+
   function broadcastAllViews() {
     const ids = wasmPlayerIds();
     for (const pid of ids) {
@@ -128,29 +145,22 @@
       if (pid === playerId) {
         applyStateView(view);
       } else {
-        const conn = guestConns.get(pid);
-        if (conn === "bc" && bc) {
-          bc.postMessage({ to: pid, type: "state", view });
-        } else if (conn && conn.open) {
-          conn.send({ type: "state", view });
-        }
+        sendToGuest(pid, { type: "state", view });
       }
     }
   }
 
-  function handleHostCommand(senderId, cmd, replyConn) {
+  function handleHostCommand(senderId, cmd) {
     if (cmd.type === "send_chat") {
       cmd = { ...cmd, timestamp_ms: Date.now() };
     }
     const res = wasmDispatch(senderId, cmd);
     if (res.ok) {
       broadcastAllViews();
-    } else if (replyConn === "bc" && bc) {
-      bc.postMessage({ to: senderId, type: "error", message: res.out });
-    } else if (replyConn) {
-      if (replyConn.open) replyConn.send({ type: "error", message: res.out });
-    } else {
+    } else if (senderId === playerId) {
       showToast(res.out);
+    } else {
+      sendToGuest(senderId, { type: "error", message: res.out });
     }
   }
 
@@ -165,11 +175,13 @@
 
   function sendCmd(cmd) {
     if (isHostNode) {
-      handleHostCommand(playerId, cmd, null);
-    } else if (hostConn === "bc" && bc) {
+      handleHostCommand(playerId, cmd);
+    } else if (hostTransport === "bc" && bc) {
       bc.postMessage({ from: playerId, ...cmd });
-    } else if (hostConn && hostConn.open) {
-      hostConn.send(cmd);
+    } else if (hostTransport === "mqtt" && mqttClient && mqttClient.connected) {
+      mqttClient.publish(topicHost(roomCode), JSON.stringify({ from: playerId, ...cmd }), {
+        qos: 1,
+      });
     } else {
       showToast("Connecting to Matsya Court host...");
     }
@@ -186,17 +198,7 @@
     return out;
   }
 
-  function peerConfig() {
-    return {
-      config: {
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" },
-          { urls: "stun:stun.cloudflare.com:3478" },
-        ],
-      },
-    };
-  }
+  const MQTT_BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
 
   async function startAsHost(code) {
     isHostNode = true;
@@ -205,7 +207,7 @@
     copyLinkBtn.classList.remove("hidden");
     window.history.replaceState({}, "", `${window.location.pathname}?room=${encodeURIComponent(roomCode)}`);
 
-    mainStage.innerHTML = `<div class="card"><h2>Opening King Virata's Sabha...</h2><p>Loading Rust WASM engine &amp; WebRTC host...</p></div>`;
+    mainStage.innerHTML = `<div class="card"><h2>Opening King Virata's Sabha...</h2><p>Loading Rust WASM engine &amp; connecting court relay...</p></div>`;
 
     await loadWasm();
     wasmInitRoom(roomCode);
@@ -226,60 +228,66 @@
             display_name: msg.display_name,
           });
           if (res.ok) {
-            guestConns.set(pid, "bc");
+            guestTransports.set(pid, "bc");
             broadcastAllViews();
           } else {
             bc.postMessage({ to: pid, type: "error", message: res.out });
           }
         } else if (msg.from) {
-          handleHostCommand(msg.from, msg, "bc");
+          handleHostCommand(msg.from, msg);
         }
       };
     }
 
-    peer = new Peer(`matsya-sabha-${roomCode}`, peerConfig());
-    peer.on("open", () => {
-      showToast(`Sabha ${roomCode} is open for remote players!`);
-    });
-    peer.on("error", (err) => {
-      showToast(`Court network notice: ${err.type || err.message}`);
+    // Cross-browser / cross-device MQTT over WSS
+    mqttClient = mqtt.connect(MQTT_BROKER_URL, {
+      clientId: `matsya_host_${roomCode}_${Math.random().toString(36).slice(2, 7)}`,
+      clean: true,
+      reconnectPeriod: 2500,
     });
 
-    peer.on("connection", (conn) => {
-      let boundPlayerId = null;
-      conn.on("data", (msg) => {
-        if (!msg || typeof msg !== "object") return;
-        if (msg.type === "join") {
-          boundPlayerId = msg.player_id;
-          const res = wasmDispatch(boundPlayerId, {
-            type: "join",
-            player_id: boundPlayerId,
-            display_name: msg.display_name,
-          });
-          if (res.ok) {
-            guestConns.set(boundPlayerId, conn);
-            broadcastAllViews();
-          } else if (conn.open) {
-            conn.send({ type: "error", message: res.out });
-          }
-          return;
-        }
-        if (boundPlayerId) {
-          handleHostCommand(boundPlayerId, msg, conn);
+    mqttClient.on("connect", () => {
+      mqttClient.subscribe(topicHost(roomCode), { qos: 1 }, (err) => {
+        if (!err) {
+          showToast(`Sabha ${roomCode} is open for all browsers & devices!`);
         }
       });
+    });
 
-      conn.on("close", () => {
-        if (boundPlayerId) {
-          guestConns.delete(boundPlayerId);
-          wasmDispatch(boundPlayerId, {
-            type: "set_connected",
-            player_id: boundPlayerId,
-            connected: false,
-          });
+    mqttClient.on("message", (_topic, payload) => {
+      let msg;
+      try {
+        msg = JSON.parse(payload.toString());
+      } catch {
+        return;
+      }
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "join") {
+        const pid = msg.player_id;
+        const res = wasmDispatch(pid, {
+          type: "join",
+          player_id: pid,
+          display_name: msg.display_name,
+        });
+        if (res.ok) {
+          guestTransports.set(pid, "mqtt");
           broadcastAllViews();
+        } else {
+          mqttClient.publish(
+            topicToPlayer(roomCode, pid),
+            JSON.stringify({ type: "error", message: res.out }),
+            { qos: 1 }
+          );
         }
-      });
+        return;
+      }
+      if (msg.from) {
+        handleHostCommand(msg.from, msg);
+      }
+    });
+
+    mqttClient.on("error", (err) => {
+      showToast(`Court relay error: ${err.message || err}`);
     });
   }
 
@@ -293,7 +301,7 @@
     mainStage.innerHTML = `
       <div class="card">
         <h2>Joining Sabha ${escapeHtml(roomCode)}...</h2>
-        <p id="join-status-text">Establishing connection to the host...</p>
+        <p id="join-status-text">Connecting to host...</p>
         <div class="action-row">
           <button id="back-to-gate-btn" class="btn btn-secondary btn-sm" type="button">Back to Room Entry</button>
         </div>
@@ -301,7 +309,7 @@
     `;
     document.getElementById("back-to-gate-btn").addEventListener("click", () => {
       clearTimeout(guestJoinTimer);
-      if (peer) peer.destroy();
+      if (mqttClient) mqttClient.end(true);
       if (bc) bc.close();
       roomCode = "";
       window.history.replaceState({}, "", window.location.pathname);
@@ -317,7 +325,7 @@
         const msg = ev.data;
         if (!msg || msg.to !== playerId) return;
         if (msg.type === "state") {
-          hostConn = "bc";
+          hostTransport = "bc";
           clearTimeout(guestJoinTimer);
           applyStateView(msg.view);
         } else if (msg.type === "error") {
@@ -327,66 +335,64 @@
       bc.postMessage({ type: "join", player_id: playerId, display_name: displayName });
     }
 
-    // Also connect via PeerJS for cross-device / remote players
-    peer = new Peer(undefined, peerConfig());
-    let attempt = 0;
+    // Cross-browser / cross-device MQTT over WSS
+    mqttClient = mqtt.connect(MQTT_BROKER_URL, {
+      clientId: `matsya_guest_${playerId}_${Math.random().toString(36).slice(2, 7)}`,
+      clean: true,
+      reconnectPeriod: 2500,
+    });
 
-    const tryPeerConnect = () => {
-      if (hostConn === "bc" || (hostConn && hostConn.open)) return;
-      attempt += 1;
+    let attempts = 0;
+    const sendMqttJoin = () => {
+      if (hostTransport === "bc" || currentView) return;
+      attempts += 1;
       const statusEl = document.getElementById("join-status-text");
       if (statusEl) {
-        statusEl.textContent = `Connecting to host for room ${roomCode} (attempt ${attempt})...`;
+        statusEl.textContent = `Joining room ${roomCode} (attempt ${attempts})...`;
       }
-
-      const conn = peer.connect(`matsya-sabha-${roomCode}`, {
-        reliable: true,
-        serialization: "json",
-      });
-      hostConn = conn;
-
-      conn.on("open", () => {
-        clearTimeout(guestJoinTimer);
-        conn.send({ type: "join", player_id: playerId, display_name: displayName });
-      });
-      conn.on("data", (msg) => {
-        if (msg.type === "error") {
-          showToast(msg.message);
-        } else if (msg.type === "state") {
-          applyStateView(msg.view);
+      mqttClient.publish(
+        topicHost(roomCode),
+        JSON.stringify({ type: "join", player_id: playerId, display_name: displayName }),
+        { qos: 1 }
+      );
+      if (attempts < 5) {
+        guestJoinTimer = setTimeout(sendMqttJoin, 2500);
+      } else {
+        const el = document.getElementById("join-status-text");
+        if (el) {
+          el.textContent = `No response from host for room ${roomCode}. Make sure the host's tab is open.`;
         }
-      });
-      conn.on("close", () => {
-        if (hostConn === conn) {
-          showToast("Disconnected from host. Reconnecting...");
-          guestJoinTimer = setTimeout(tryPeerConnect, 2500);
-        }
-      });
-
-      guestJoinTimer = setTimeout(() => {
-        if (hostConn !== "bc" && (!conn || !conn.open) && attempt < 5) {
-          tryPeerConnect();
-        } else if (hostConn !== "bc" && (!conn || !conn.open)) {
-          const el = document.getElementById("join-status-text");
-          if (el) {
-            el.textContent = `Could not reach host for room ${roomCode}. Make sure the host's tab is open and try again.`;
-          }
-        }
-      }, 3500);
+      }
     };
 
-    peer.on("open", () => {
-      if (hostConn !== "bc") {
-        tryPeerConnect();
+    mqttClient.on("connect", () => {
+      if (hostTransport === "bc") return;
+      mqttClient.subscribe(topicToPlayer(roomCode, playerId), { qos: 1 }, (err) => {
+        if (!err) {
+          sendMqttJoin();
+        }
+      });
+    });
+
+    mqttClient.on("message", (_topic, payload) => {
+      if (hostTransport === "bc") return;
+      let msg;
+      try {
+        msg = JSON.parse(payload.toString());
+      } catch {
+        return;
+      }
+      if (msg.type === "error") {
+        showToast(msg.message);
+      } else if (msg.type === "state") {
+        hostTransport = "mqtt";
+        clearTimeout(guestJoinTimer);
+        applyStateView(msg.view);
       }
     });
 
-    peer.on("error", (err) => {
-      if (err.type === "peer-unavailable") {
-        showToast(`Room ${roomCode} not found yet — retrying...`);
-      } else {
-        showToast(`Network error: ${err.type || err.message}`);
-      }
+    mqttClient.on("error", (err) => {
+      showToast(`Network error: ${err.message || err}`);
     });
   }
 
