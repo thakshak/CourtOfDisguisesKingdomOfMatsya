@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Battle of Matsya: Shadows in the Court</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="palace-backdrop"></div>
+  <div class="torch-vignette"></div>
+
+  <audio id="bgm-audio" src="./assets/audio/bgm_court_intrigue.mp3" loop preload="auto"></audio>
+
+  <header class="top-bar">
+    <div class="brand">
+      <img src="./assets/images/icon_royal_signet.png" alt="Royal Signet" class="brand-icon" />
+      <div>
+        <h1>Battle of Matsya</h1>
+        <p class="subtitle">Shadows in the Court &bull; Sabha of King Virata</p>
+      </div>
+    </div>
+
+    <div class="top-controls">
+      <div id="gpg-badge" class="gpg-badge" title="Google Play Games Profile">
+        <span class="gpg-dot"></span>
+        <span id="gpg-name-label">Connecting...</span>
+      </div>
+      <div id="room-pill" class="room-pill">Room: <strong id="room-code-label">----</strong></div>
+      <button id="copy-link-btn" class="btn btn-secondary btn-sm hidden" type="button">Copy Invite</button>
+      <button id="disguise-peek-btn" class="btn btn-gold btn-sm hidden" type="button">View Disguise</button>
+      <button id="help-btn" class="btn btn-secondary btn-sm" type="button">How to Play</button>
+      <button id="audio-toggle-btn" class="btn btn-secondary btn-sm" type="button">Music: Off</button>
+    </div>
+  </header>
+
+  <div id="toast-banner" class="toast-banner hidden"></div>
+
+  <main class="court-layout">
+    <section id="main-stage" class="main-stage">
+      <!-- Dynamic Screen Content Rendered by app.js -->
+      <div class="card loading-card">
+        <h2>Entering the Torch-Lit Sabha...</h2>
+        <p>Establishing secure court connection.</p>
+      </div>
+    </section>
+
+    <aside class="whispers-panel">
+      <div class="whispers-header">
+        <img src="./assets/images/token_compass_star.png" alt="Compass Star" class="whispers-icon" />
+        <div>
+          <h3>Court Whispers</h3>
+          <span>Sabha Side Chat</span>
+        </div>
+      </div>
+      <div id="chat-messages" class="chat-messages"></div>
+      <form id="chat-form" class="chat-form">
+        <input
+          id="chat-input"
+          type="text"
+          maxlength="280"
+          placeholder="Whisper to the court..."
+          autocomplete="off"
+        />
+        <button type="submit" class="btn btn-gold btn-sm">Send</button>
+      </form>
+    </aside>
+  </main>
+
+  <div id="help-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="help-modal-title">
+    <div class="modal-card card">
+      <div class="modal-header">
+        <h2 id="help-modal-title" class="screen-title" style="margin:0;">Sabha Scroll &bull; How to Play</h2>
+        <button id="close-help-btn" class="btn btn-secondary btn-sm" type="button">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="help-section">
+          <h3>Lore &amp; Win Conditions (5–10 Players)</h3>
+          <p>Hidden heroes in King Virata's court must defend Matsya across 5 Battles against Trigarta and Hastinapura infiltrators.</p>
+          <ul>
+            <li><strong style="color:var(--emerald-bright);">Dharma Defenders Win:</strong> Succeed in <strong>3 out of 5 Battles</strong> AND keep <strong>Kanka's</strong> true identity hidden at the end.</li>
+            <li><strong style="color:var(--crimson-bright);">Infiltrators Win:</strong> Sabotage <strong>3 out of 5 Battles</strong>, cause <strong>5 consecutive council rejections (deadlocks)</strong>, OR correctly unmask <strong>Kanka</strong> if Dharma wins 3 battles.</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Secret Roles &amp; Vision</h3>
+          <ul>
+            <li><strong>Kanka (Dharma Advisor):</strong> Sees all Infiltrators <em>except Kichaka</em>. Must stay hidden from King Susharma.</li>
+            <li><strong>Brihannala (Dharma Master):</strong> Sees <em>Kanka</em> and <em>Chief Spy</em>, but cannot tell which is which.</li>
+            <li><strong>Ballava, Syrandhri, Granthika, Tantipala (Dharma Courtiers):</strong> No special vision; deduce allies through votes and battle outcomes.</li>
+            <li><strong>King Susharma (Infiltrator Commander):</strong> Knows fellow Infiltrators (except Karna). Gets the final Unmasking guess if Dharma wins 3 battles.</li>
+            <li><strong>Chief Spy (Infiltrator Envoy):</strong> Knows fellow Infiltrators (except Karna). Appears as Kanka to Brihannala.</li>
+            <li><strong>Kichaka (Infiltrator General, 7+ players):</strong> Knows fellow Infiltrators (except Karna). Hidden from Kanka's vision.</li>
+            <li><strong>Karna (Lone Infiltrator, 10 players):</strong> Does not know other Infiltrators, and they do not know Karna.</li>
+          </ul>
+        </div>
+
+        <div class="help-section">
+          <h3>Turn Sequence &amp; Battles</h3>
+          <ol>
+            <li><strong>Council Proposal:</strong> The Leader holding the Royal Signet selects the exact team size for the current battle and taps <em>PROPOSE TEAM</em>.</li>
+            <li><strong>Court Vote:</strong> All players vote <em>Approve (YES)</em> or <em>Reject (NO)</em>. Majority YES sends the team to battle and resets deadlocks to 0. Tie or majority NO passes the Signet clockwise and adds 1 deadlock (5 in a row = Infiltrator win).</li>
+            <li><strong>Secret Battle:</strong> Chosen team members secretly play <em>Defend</em> or <em>Sabotage</em> (Dharma can only Defend). Any 1 Sabotage fails the battle — <strong>except Battle 4 in 7–10 player games, which requires 2 Sabotages to fail</strong>.</li>
+            <li><strong>Final Unmasking:</strong> If Dharma wins 3 battles, King Susharma gets one guess to unmask Kanka.</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
