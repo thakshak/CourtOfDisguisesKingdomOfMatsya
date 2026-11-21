@@ -21,12 +21,14 @@
   let lastPhase = null;
   let toastTimer = null;
 
-  // WASM + WebRTC P2P state
+  // WASM + WebRTC P2P + BroadcastChannel state
   let wasm = null;
   let peer = null;
+  let bc = null;
   let isHostNode = false;
   let hostConn = null;
-  const guestConns = new Map(); // playerId -> DataConnection
+  let guestJoinTimer = null;
+  const guestConns = new Map(); // playerId -> DataConnection | "bc"
 
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -127,7 +129,9 @@
         applyStateView(view);
       } else {
         const conn = guestConns.get(pid);
-        if (conn && conn.open) {
+        if (conn === "bc" && bc) {
+          bc.postMessage({ to: pid, type: "state", view });
+        } else if (conn && conn.open) {
           conn.send({ type: "state", view });
         }
       }
@@ -141,6 +145,8 @@
     const res = wasmDispatch(senderId, cmd);
     if (res.ok) {
       broadcastAllViews();
+    } else if (replyConn === "bc" && bc) {
+      bc.postMessage({ to: senderId, type: "error", message: res.out });
     } else if (replyConn) {
       if (replyConn.open) replyConn.send({ type: "error", message: res.out });
     } else {
@@ -160,6 +166,8 @@
   function sendCmd(cmd) {
     if (isHostNode) {
       handleHostCommand(playerId, cmd, null);
+    } else if (hostConn === "bc" && bc) {
+      bc.postMessage({ from: playerId, ...cmd });
     } else if (hostConn && hostConn.open) {
       hostConn.send(cmd);
     } else {
@@ -203,7 +211,35 @@
     wasmDispatch(playerId, { type: "join", player_id: playerId, display_name: displayName });
     broadcastAllViews();
 
+    // Same-browser tab fast-path
+    if ("BroadcastChannel" in window) {
+      bc = new BroadcastChannel(`matsya-sabha-${roomCode}`);
+      bc.onmessage = (ev) => {
+        const msg = ev.data;
+        if (!msg || typeof msg !== "object" || msg.to) return;
+        if (msg.type === "join") {
+          const pid = msg.player_id;
+          const res = wasmDispatch(pid, {
+            type: "join",
+            player_id: pid,
+            display_name: msg.display_name,
+          });
+          if (res.ok) {
+            guestConns.set(pid, "bc");
+            broadcastAllViews();
+          } else {
+            bc.postMessage({ to: pid, type: "error", message: res.out });
+          }
+        } else if (msg.from) {
+          handleHostCommand(msg.from, msg, "bc");
+        }
+      };
+    }
+
     peer = new Peer(`matsya-sabha-${roomCode}`, peerConfig());
+    peer.on("open", () => {
+      showToast(`Sabha ${roomCode} is open for remote players!`);
+    });
     peer.on("error", (err) => {
       showToast(`Court network notice: ${err.type || err.message}`);
     });
@@ -253,31 +289,103 @@
     copyLinkBtn.classList.remove("hidden");
     window.history.replaceState({}, "", `${window.location.pathname}?room=${encodeURIComponent(roomCode)}`);
 
-    mainStage.innerHTML = `<div class="card"><h2>Joining Sabha ${escapeHtml(roomCode)}...</h2><p>Establishing peer-to-peer connection to the host...</p></div>`;
+    mainStage.innerHTML = `
+      <div class="card">
+        <h2>Joining Sabha ${escapeHtml(roomCode)}...</h2>
+        <p id="join-status-text">Establishing connection to the host...</p>
+        <div class="action-row">
+          <button id="back-to-gate-btn" class="btn btn-secondary btn-sm" type="button">Back to Room Entry</button>
+        </div>
+      </div>
+    `;
+    document.getElementById("back-to-gate-btn").addEventListener("click", () => {
+      clearTimeout(guestJoinTimer);
+      if (peer) peer.destroy();
+      if (bc) bc.close();
+      roomCode = "";
+      window.history.replaceState({}, "", window.location.pathname);
+      copyLinkBtn.classList.add("hidden");
+      roomCodeLabel.textContent = "----";
+      renderRoomGate();
+    });
 
+    // Try instant same-browser BroadcastChannel first
+    if ("BroadcastChannel" in window) {
+      bc = new BroadcastChannel(`matsya-sabha-${roomCode}`);
+      bc.onmessage = (ev) => {
+        const msg = ev.data;
+        if (!msg || msg.to !== playerId) return;
+        if (msg.type === "state") {
+          hostConn = "bc";
+          clearTimeout(guestJoinTimer);
+          applyStateView(msg.view);
+        } else if (msg.type === "error") {
+          showToast(msg.message);
+        }
+      };
+      bc.postMessage({ type: "join", player_id: playerId, display_name: displayName });
+    }
+
+    // Also connect via PeerJS for cross-device / remote players
     peer = new Peer(undefined, peerConfig());
-    peer.on("open", () => {
-      hostConn = peer.connect(`matsya-sabha-${roomCode}`, { reliable: true });
-      hostConn.on("open", () => {
-        hostConn.send({ type: "join", player_id: playerId, display_name: displayName });
+    let attempt = 0;
+
+    const tryPeerConnect = () => {
+      if (hostConn === "bc" || (hostConn && hostConn.open)) return;
+      attempt += 1;
+      const statusEl = document.getElementById("join-status-text");
+      if (statusEl) {
+        statusEl.textContent = `Connecting to host for room ${roomCode} (attempt ${attempt})...`;
+      }
+
+      const conn = peer.connect(`matsya-sabha-${roomCode}`, {
+        reliable: true,
+        serialization: "json",
       });
-      hostConn.on("data", (msg) => {
+      hostConn = conn;
+
+      conn.on("open", () => {
+        clearTimeout(guestJoinTimer);
+        conn.send({ type: "join", player_id: playerId, display_name: displayName });
+      });
+      conn.on("data", (msg) => {
         if (msg.type === "error") {
           showToast(msg.message);
         } else if (msg.type === "state") {
           applyStateView(msg.view);
         }
       });
-      hostConn.on("close", () => {
-        showToast("Disconnected from host. Attempting to reconnect...");
-        setTimeout(() => {
-          if (!isHostNode) joinAsGuest(roomCode);
-        }, 2000);
+      conn.on("close", () => {
+        if (hostConn === conn) {
+          showToast("Disconnected from host. Reconnecting...");
+          guestJoinTimer = setTimeout(tryPeerConnect, 2500);
+        }
       });
+
+      guestJoinTimer = setTimeout(() => {
+        if (hostConn !== "bc" && (!conn || !conn.open) && attempt < 5) {
+          tryPeerConnect();
+        } else if (hostConn !== "bc" && (!conn || !conn.open)) {
+          const el = document.getElementById("join-status-text");
+          if (el) {
+            el.textContent = `Could not reach host for room ${roomCode}. Make sure the host's tab is open and try again.`;
+          }
+        }
+      }, 3500);
+    };
+
+    peer.on("open", () => {
+      if (hostConn !== "bc") {
+        tryPeerConnect();
+      }
     });
 
     peer.on("error", (err) => {
-      showToast(`Could not reach room ${roomCode}: ${err.type || err.message}`);
+      if (err.type === "peer-unavailable") {
+        showToast(`Room ${roomCode} not found yet — retrying...`);
+      } else {
+        showToast(`Network error: ${err.type || err.message}`);
+      }
     });
   }
 
