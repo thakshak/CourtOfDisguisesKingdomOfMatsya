@@ -1,0 +1,18 @@
+{
+  "name": "Battle of Matsya: Shadows in the Court",
+  "short_name": "Battle of Matsya",
+  "description": "5-10 player turn-based social deduction game set in King Virata's royal Sabha.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#120d16",
+  "theme_color": "#120d16",
+  "icons": [
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
