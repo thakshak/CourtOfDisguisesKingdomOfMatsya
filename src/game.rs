@@ -494,7 +494,7 @@ impl GameEngine {
         display_name: &str,
     ) -> Result<(), String> {
         if self.phase != PublicPhase::Lobby {
-            return Err("Cannot change Google Play Games display name after council begins.".to_string());
+            return Err("Cannot change display name after council begins.".to_string());
         }
         let clean = sanitize_display_name(display_name);
         if clean.is_empty() {

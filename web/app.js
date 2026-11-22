@@ -9,11 +9,11 @@
     sessionStorage.setItem("matsya_player_id", playerId);
   }
 
+  let hasSetName = Boolean(params.get("name") || sessionStorage.getItem("matsya_custom_name"));
   let displayName =
     params.get("name") ||
-    sessionStorage.getItem("matsya_gpg_name") ||
+    sessionStorage.getItem("matsya_custom_name") ||
     `Envoy-${playerId.slice(2, 6).toUpperCase()}`;
-  sessionStorage.setItem("matsya_gpg_name", displayName);
 
   let currentView = null;
   let selectedTeamIds = new Set();
@@ -49,7 +49,7 @@
   const toastBanner = document.getElementById("toast-banner");
 
   roomCodeLabel.textContent = roomCode || "----";
-  gpgNameLabel.textContent = `GPG: ${displayName}`;
+  gpgNameLabel.textContent = hasSetName ? displayName : "Guest";
   if (roomCode) {
     copyLinkBtn.classList.remove("hidden");
   }
@@ -555,8 +555,21 @@
       .join("");
 
     mainStage.innerHTML = `
-      <div class="card ${isHost && canStart ? "needs-action" : ""}">
-        ${isHost && canStart ? '<div class="action-cue-badge">Your Action Required</div>' : ""}
+      ${
+        !hasSetName
+          ? `<div class="card needs-action">
+              <div class="action-cue-badge">Your Action Required</div>
+              <h2 class="screen-title">Welcome to Sabha ${escapeHtml(roomCode)}</h2>
+              <p class="screen-desc">Enter your name so the rest of the court knows who you are:</p>
+              <form id="gpg-form" class="profile-row" style="margin-bottom:0;">
+                <input id="gpg-input" type="text" maxlength="24" placeholder="Enter your name..." autocomplete="off" required />
+                <button type="submit" class="btn btn-gold">Save Name</button>
+              </form>
+            </div>`
+          : ""
+      }
+      <div class="card ${hasSetName && isHost && canStart ? "needs-action" : ""}">
+        ${hasSetName && isHost && canStart ? '<div class="action-cue-badge">Your Action Required</div>' : ""}
         <h2 class="screen-title">Matsya Court Lobby</h2>
         <p class="screen-desc">
           Gather 5 to 10 courtiers in King Virata's Sabha. Share room code <strong>${escapeHtml(
@@ -564,11 +577,15 @@
           )}</strong> or click <strong>Copy Invite</strong>.
         </p>
 
-        <form id="gpg-form" class="profile-row">
-          <label for="gpg-input" style="font-size:0.9rem;"><strong>Google Play Games Name:</strong></label>
-          <input id="gpg-input" type="text" maxlength="24" value="${escapeHtml(displayName)}" />
-          <button type="submit" class="btn btn-secondary btn-sm">Update Name</button>
-        </form>
+        ${
+          hasSetName
+            ? `<form id="gpg-form" class="profile-row">
+                <label for="gpg-input" style="font-size:0.9rem;"><strong>Your Name:</strong></label>
+                <input id="gpg-input" type="text" maxlength="24" value="${escapeHtml(displayName)}" />
+                <button type="submit" class="btn btn-secondary btn-sm">Update Name</button>
+              </form>`
+            : ""
+        }
 
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
           <strong>Joined Courtiers: ${count} / 10 (Minimum 5 required)</strong>
@@ -588,8 +605,9 @@
       const next = document.getElementById("gpg-input").value.trim();
       if (!next) return;
       displayName = next;
-      sessionStorage.setItem("matsya_gpg_name", displayName);
-      gpgNameLabel.textContent = `GPG: ${displayName}`;
+      hasSetName = true;
+      sessionStorage.setItem("matsya_custom_name", displayName);
+      gpgNameLabel.textContent = displayName;
       sendCmd({ type: "update_name", display_name: displayName });
     });
 
@@ -1017,7 +1035,7 @@
 
     const me = currentView.players.find((p) => p.id === currentView.self_id);
     if (me) {
-      gpgNameLabel.textContent = `GPG: ${me.display_name}`;
+      gpgNameLabel.textContent = me.display_name;
     }
 
     const showPeek =
@@ -1072,13 +1090,8 @@
         <div class="action-cue-badge">Enter the Sabha</div>
         <h2 class="screen-title">Enter King Virata's Sabha</h2>
         <p class="screen-desc">
-          Create a new 4-character court room (hosted in your browser via Rust WASM + WebRTC) or enter a room code shared by your host.
+          Create a new 4-character court room or enter a room code shared by your host. You will enter your name after joining the room.
         </p>
-
-        <form id="gate-name-form" class="profile-row">
-          <label for="gate-name-input" style="font-size:0.9rem;"><strong>Google Play Games Name:</strong></label>
-          <input id="gate-name-input" type="text" maxlength="24" value="${escapeHtml(displayName)}" />
-        </form>
 
         <div class="room-gate-grid">
           <div class="room-gate-box">
@@ -1097,30 +1110,13 @@
       </div>
     `;
 
-    const nameInput = document.getElementById("gate-name-input");
-    const syncName = () => {
-      const val = nameInput.value.trim();
-      if (val) {
-        displayName = val;
-        sessionStorage.setItem("matsya_gpg_name", displayName);
-        gpgNameLabel.textContent = `GPG: ${displayName}`;
-      }
-    };
-
-    document.getElementById("gate-name-form").addEventListener("submit", (e) => {
-      e.preventDefault();
-      syncName();
-    });
-
     document.getElementById("create-room-btn").addEventListener("click", () => {
-      syncName();
       const code = generateRoomCode();
       startAsHost(code);
     });
 
     document.getElementById("join-room-form").addEventListener("submit", (e) => {
       e.preventDefault();
-      syncName();
       const code = document.getElementById("room-code-input").value.toUpperCase().replace(/[^A-Z0-9]/g, "");
       if (code.length !== 4) {
         showToast("Please enter a valid 4-character room code.");

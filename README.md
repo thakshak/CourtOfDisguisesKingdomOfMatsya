@@ -6,9 +6,9 @@ A 5–10 player turn-based social deduction game set in King Virata's torch-lit 
 
 ## How to Play Online
 1. Open the [Live Game](https://thakshak.github.io/CourtOfDisguisesKingdomOfMatsya/).
-2. Enter your **Google Play Games** display name.
-3. Click **Create New Room** to generate a 4-character room code and share the invite link (or code) with 4–9 other players.
-4. Once 5–10 players have joined the **Matsya Court Lobby**, the host clicks **BEGIN COUNCIL**.
+2. Click **Create New Room** to generate a 4-character room code and share the invite link (or code) with 4–9 other players, or enter a room code to join.
+3. Enter your display name after joining the **Matsya Court Lobby**.
+4. Once 5–10 players have joined, the host clicks **BEGIN COUNCIL**.
 
 ## Local Development & Build
 - Run unit tests:
