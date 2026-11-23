@@ -4,8 +4,9 @@ set -euo pipefail
 cargo build --lib --target wasm32-unknown-unknown --release --offline
 
 rm -rf docs
-mkdir -p docs/assets
+mkdir -p docs/assets docs/.well-known
 cp web/index.html web/styles.css web/app.js web/manifest.json web/sw.js web/icon-512.png docs/
+cp web/.well-known/assetlinks.json docs/.well-known/assetlinks.json
 cp target/wasm32-unknown-unknown/release/battle_of_matsya.wasm docs/battle_of_matsya.wasm
 cp -R assets/* docs/assets/
 touch docs/.nojekyll

@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "io.github.thakshak.matsya",
+      "sha256_cert_fingerprints": [
+        "36:43:EE:8E:5A:2A:D5:55:85:4F:8C:33:8F:54:75:69:A7:52:B0:3F:69:F1:A1:C4:A0:C9:EF:C2:5B:43:73:37"
+      ]
+    }
+  }
+]
