@@ -4,22 +4,16 @@
   let roomCode = rawRoom.length === 4 ? rawRoom : "";
   let isSpectator = params.get("spectator") === "1";
 
-  let playerId =
-    sessionStorage.getItem("matsya_player_id") || localStorage.getItem("matsya_player_id");
+  let playerId = localStorage.getItem("matsya_player_id");
   if (!playerId) {
     playerId = "p_" + Math.random().toString(36).slice(2, 10);
+    localStorage.setItem("matsya_player_id", playerId);
   }
-  sessionStorage.setItem("matsya_player_id", playerId);
-  localStorage.setItem("matsya_player_id", playerId);
 
-  const savedCustomName =
-    params.get("name") ||
-    sessionStorage.getItem("matsya_custom_name") ||
-    localStorage.getItem("matsya_custom_name");
+  const savedCustomName = params.get("name") || localStorage.getItem("matsya_custom_name");
   let hasSetName = Boolean(savedCustomName);
   let displayName = savedCustomName || `Envoy-${playerId.slice(2, 6).toUpperCase()}`;
   if (savedCustomName) {
-    sessionStorage.setItem("matsya_custom_name", savedCustomName);
     localStorage.setItem("matsya_custom_name", savedCustomName);
   }
 
@@ -142,19 +136,13 @@
     if (!wasm || !isHostNode || !roomCode) return;
     if (wasm.wasm_export_state() === 0) {
       const json = readWasmOut();
-      sessionStorage.setItem("matsya_host_room", roomCode);
-      sessionStorage.setItem("matsya_host_snapshot", json);
       localStorage.setItem("matsya_host_room", roomCode);
       localStorage.setItem("matsya_host_snapshot", json);
     }
   }
 
   function loadHostSnapshot(code) {
-    const ssRoom = sessionStorage.getItem("matsya_host_room");
     const lsRoom = localStorage.getItem("matsya_host_room");
-    if (ssRoom === code && sessionStorage.getItem("matsya_host_snapshot")) {
-      return sessionStorage.getItem("matsya_host_snapshot");
-    }
     if (lsRoom === code && localStorage.getItem("matsya_host_snapshot")) {
       return localStorage.getItem("matsya_host_snapshot");
     }
@@ -835,7 +823,6 @@
         if (!next) return;
         displayName = next;
         hasSetName = true;
-        sessionStorage.setItem("matsya_custom_name", displayName);
         localStorage.setItem("matsya_custom_name", displayName);
         gpgNameLabel.textContent = displayName;
         sendCmd({ type: "update_name", display_name: displayName });
