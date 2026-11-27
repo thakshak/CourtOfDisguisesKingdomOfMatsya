@@ -14,6 +14,7 @@ enum WasmCommand {
     Join { player_id: String, display_name: String },
     SetConnected { player_id: String, connected: bool },
     UpdateName { display_name: String },
+    KickPlayer { target_id: String },
     StartGame,
     AcknowledgeDisguise,
     ProposeTeam { team_ids: Vec<String> },
@@ -23,6 +24,7 @@ enum WasmCommand {
     AdvanceFromBattleOutcome,
     SubmitUnmasking { target_id: String },
     PlayAgain,
+    ResetGame,
     SendChat { text: String, timestamp_ms: u64 },
 }
 
@@ -113,6 +115,9 @@ pub unsafe extern "C" fn wasm_dispatch(
             WasmCommand::UpdateName { display_name } => {
                 engine.update_display_name(&player_id, &display_name)
             }
+            WasmCommand::KickPlayer { target_id } => {
+                engine.kick_lobby_player(&player_id, &target_id)
+            }
             WasmCommand::StartGame => engine.start_game(&player_id),
             WasmCommand::AcknowledgeDisguise => engine.acknowledge_disguise(&player_id),
             WasmCommand::ProposeTeam { team_ids } => engine.propose_team(&player_id, team_ids),
@@ -128,13 +133,17 @@ pub unsafe extern "C" fn wasm_dispatch(
                 engine.submit_unmasking(&player_id, &target_id)
             }
             WasmCommand::PlayAgain => engine.play_again(&player_id),
+            WasmCommand::ResetGame => engine.reset_game(&player_id),
             WasmCommand::SendChat { text, timestamp_ms } => {
                 engine.add_chat_message(&player_id, &text, timestamp_ms)
             }
         };
 
         match res {
-            Ok(()) => set_out("ok".to_string()),
+            Ok(()) => {
+                engine.bump_version();
+                set_out("ok".to_string())
+            }
             Err(err) => set_err(err),
         }
     })
@@ -162,6 +171,21 @@ pub unsafe extern "C" fn wasm_view_for_player(
 }
 
 #[no_mangle]
+pub extern "C" fn wasm_view_for_spectator() -> i32 {
+    ENGINE.with(|e| {
+        let borrow = e.borrow();
+        let Some(engine) = borrow.as_ref() else {
+            return set_err("Game engine not initialized.".to_string());
+        };
+        let view = engine.view_for_spectator();
+        match serde_json::to_string(&view) {
+            Ok(json) => set_out(json),
+            Err(err) => set_err(format!("Serialization error: {err}")),
+        }
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn wasm_player_ids() -> i32 {
     ENGINE.with(|e| {
         let borrow = e.borrow();
@@ -173,4 +197,33 @@ pub extern "C" fn wasm_player_ids() -> i32 {
             Err(err) => set_err(format!("Serialization error: {err}")),
         }
     })
+}
+
+#[no_mangle]
+pub extern "C" fn wasm_export_state() -> i32 {
+    ENGINE.with(|e| {
+        let borrow = e.borrow();
+        let Some(engine) = borrow.as_ref() else {
+            return set_err("Game engine not initialized.".to_string());
+        };
+        match serde_json::to_string(engine) {
+            Ok(json) => set_out(json),
+            Err(err) => set_err(format!("Serialization error: {err}")),
+        }
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wasm_import_state(state_ptr: *const u8, state_len: usize) -> i32 {
+    let state_str =
+        String::from_utf8_lossy(slice::from_raw_parts(state_ptr, state_len)).into_owned();
+    match serde_json::from_str::<GameEngine>(&state_str) {
+        Ok(engine) => {
+            ENGINE.with(|e| {
+                *e.borrow_mut() = Some(engine);
+            });
+            set_out("ok".to_string())
+        }
+        Err(err) => set_err(format!("Failed to restore state: {err}")),
+    }
 }

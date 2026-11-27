@@ -844,3 +844,42 @@ body {
   gap: 6px;
   color: var(--text-light);
 }
+
+/* Kick button & TV Spectator Mode */
+.kick-btn {
+  background: rgba(168, 36, 50, 0.88);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.kick-btn:hover {
+  background: var(--crimson-bright);
+}
+
+.tv-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(232, 185, 72, 0.2);
+  border: 1px solid var(--gold);
+  color: var(--gold);
+  font-family: system-ui, sans-serif;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+
+.tv-stage .screen-title {
+  font-size: 1.75rem;
+}
+
+.tv-stage .battle-medallion .b-name {
+  font-size: 0.96rem;
+}

@@ -216,6 +216,8 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerView {
+    pub state_version: u64,
+    pub is_spectator: bool,
     pub self_id: PlayerId,
     pub room_code: String,
     pub phase: PublicPhase,
@@ -236,7 +238,7 @@ pub struct PlayerView {
     pub chat_messages: Vec<ChatMessage>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlayerRecord {
     id: PlayerId,
     display_name: String,
@@ -246,7 +248,7 @@ struct PlayerRecord {
     acknowledged_disguise: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimpleRng {
     state: u64,
 }
@@ -387,8 +389,10 @@ pub fn sabotages_required_for_battle(player_count: usize, battle_index: usize) -
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameEngine {
     pub room_code: String,
+    state_version: u64,
     rng: SimpleRng,
     phase: PublicPhase,
     players: Vec<PlayerRecord>,
@@ -418,6 +422,7 @@ impl GameEngine {
     fn new_with_rng(room_code: impl Into<String>, rng: SimpleRng) -> Self {
         Self {
             room_code: room_code.into(),
+            state_version: 1,
             rng,
             phase: PublicPhase::Lobby,
             players: Vec::new(),
@@ -513,6 +518,33 @@ impl GameEngine {
         if let Some(player) = self.players.iter_mut().find(|p| p.id == player_id) {
             player.connected = connected;
         }
+    }
+
+    pub fn bump_version(&mut self) {
+        self.state_version = self.state_version.wrapping_add(1);
+    }
+
+    pub fn kick_lobby_player(
+        &mut self,
+        requester_id: &str,
+        target_id: &str,
+    ) -> Result<(), String> {
+        if self.phase != PublicPhase::Lobby {
+            return Err("Players can only be removed before the council begins.".to_string());
+        }
+        let is_host = self
+            .players
+            .iter()
+            .find(|p| p.id == requester_id)
+            .map(|p| p.is_host)
+            .unwrap_or(false);
+        if !is_host {
+            return Err("Only the host can remove players from the lobby.".to_string());
+        }
+        if requester_id == target_id {
+            return Err("Host cannot remove themselves.".to_string());
+        }
+        self.remove_lobby_player(target_id)
     }
 
     pub fn remove_lobby_player(&mut self, player_id: &str) -> Result<(), String> {
@@ -885,6 +917,10 @@ impl GameEngine {
         if self.phase != PublicPhase::Victory {
             return Err("Can only Play Again after the game concludes.".to_string());
         }
+        self.reset_game(requester_id)
+    }
+
+    pub fn reset_game(&mut self, requester_id: &str) -> Result<(), String> {
         let is_host = self
             .players
             .iter()
@@ -1078,6 +1114,8 @@ impl GameEngine {
         };
 
         Some(PlayerView {
+            state_version: self.state_version,
+            is_spectator: false,
             self_id: viewer.id.clone(),
             room_code: self.room_code.clone(),
             phase: self.phase,
@@ -1097,6 +1135,78 @@ impl GameEngine {
             victory: self.victory.clone(),
             chat_messages: self.chat_messages.clone(),
         })
+    }
+
+    pub fn view_for_spectator(&self) -> PlayerView {
+        let players: Vec<PublicPlayer> = self
+            .players
+            .iter()
+            .map(|p| PublicPlayer {
+                id: p.id.clone(),
+                display_name: p.display_name.clone(),
+                is_host: p.is_host,
+                connected: p.connected,
+                has_acknowledged_disguise: p.acknowledged_disguise,
+                has_voted: self.votes.contains_key(&p.id),
+                has_acted_in_battle: self.battle_submissions.contains_key(&p.id),
+            })
+            .collect();
+
+        let leader_id = if self.phase != PublicPhase::Lobby {
+            self.players.get(self.leader_index).map(|p| p.id.clone())
+        } else {
+            None
+        };
+
+        let waiting_for_names = match self.phase {
+            PublicPhase::CourtVote => self
+                .players
+                .iter()
+                .filter(|p| !self.votes.contains_key(&p.id))
+                .map(|p| p.display_name.clone())
+                .collect(),
+            PublicPhase::SecretBattle => self
+                .proposed_team
+                .iter()
+                .filter(|id| !self.battle_submissions.contains_key(*id))
+                .filter_map(|id| self.players.iter().find(|p| &p.id == id))
+                .map(|p| p.display_name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let battle_progress = if self.phase == PublicPhase::SecretBattle {
+            Some(BattleProgressView {
+                submitted_count: self.battle_submissions.len(),
+                total_count: self.proposed_team.len(),
+                waiting_for_names: waiting_for_names.clone(),
+            })
+        } else {
+            None
+        };
+
+        PlayerView {
+            state_version: self.state_version,
+            is_spectator: true,
+            self_id: "spectator".to_string(),
+            room_code: self.room_code.clone(),
+            phase: self.phase,
+            players,
+            battles: self.battles.clone(),
+            current_battle_index: self.current_battle_index,
+            deadlock_count: self.deadlock_count,
+            leader_id,
+            proposed_team: self.proposed_team.clone(),
+            waiting_for_names,
+            ballot_results: self.ballot_results.clone(),
+            battle_progress,
+            latest_battle_outcome: self.latest_battle_outcome.clone(),
+            private_role: None,
+            private_battle_action: None,
+            private_unmasking: None,
+            victory: self.victory.clone(),
+            chat_messages: self.chat_messages.clone(),
+        }
     }
 
     fn build_private_role(&self, viewer: &PlayerRecord, role: Role) -> PrivateRoleView {

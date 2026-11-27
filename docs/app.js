@@ -2,18 +2,26 @@
   const params = new URLSearchParams(window.location.search);
   const rawRoom = (params.get("room") || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   let roomCode = rawRoom.length === 4 ? rawRoom : "";
+  let isSpectator = params.get("spectator") === "1";
 
-  let playerId = sessionStorage.getItem("matsya_player_id");
+  let playerId =
+    sessionStorage.getItem("matsya_player_id") || localStorage.getItem("matsya_player_id");
   if (!playerId) {
     playerId = "p_" + Math.random().toString(36).slice(2, 10);
-    sessionStorage.setItem("matsya_player_id", playerId);
   }
+  sessionStorage.setItem("matsya_player_id", playerId);
+  localStorage.setItem("matsya_player_id", playerId);
 
-  let hasSetName = Boolean(params.get("name") || sessionStorage.getItem("matsya_custom_name"));
-  let displayName =
+  const savedCustomName =
     params.get("name") ||
     sessionStorage.getItem("matsya_custom_name") ||
-    `Envoy-${playerId.slice(2, 6).toUpperCase()}`;
+    localStorage.getItem("matsya_custom_name");
+  let hasSetName = Boolean(savedCustomName);
+  let displayName = savedCustomName || `Envoy-${playerId.slice(2, 6).toUpperCase()}`;
+  if (savedCustomName) {
+    sessionStorage.setItem("matsya_custom_name", savedCustomName);
+    localStorage.setItem("matsya_custom_name", savedCustomName);
+  }
 
   let currentView = null;
   let selectedTeamIds = new Set();
@@ -28,6 +36,9 @@
   let isHostNode = false;
   let hostTransport = null; // "bc" | "mqtt"
   let guestJoinTimer = null;
+  let heartbeatTimer = null;
+  let guestSyncTimer = null;
+  let lastSyncAt = 0;
   const guestTransports = new Map(); // playerId -> "bc" | "mqtt"
 
   const encoder = new TextEncoder();
@@ -41,6 +52,7 @@
   const roomCodeLabel = document.getElementById("room-code-label");
   const copyLinkBtn = document.getElementById("copy-link-btn");
   const disguisePeekBtn = document.getElementById("disguise-peek-btn");
+  const resetGameBtn = document.getElementById("reset-game-btn");
   const helpBtn = document.getElementById("help-btn");
   const helpModal = document.getElementById("help-modal");
   const closeHelpBtn = document.getElementById("close-help-btn");
@@ -49,7 +61,7 @@
   const toastBanner = document.getElementById("toast-banner");
 
   roomCodeLabel.textContent = roomCode || "----";
-  gpgNameLabel.textContent = hasSetName ? displayName : "Guest";
+  gpgNameLabel.textContent = isSpectator ? "TV Spectator" : hasSetName ? displayName : "Guest";
   if (roomCode) {
     copyLinkBtn.classList.remove("hidden");
   }
@@ -114,10 +126,39 @@
     return JSON.parse(out);
   }
 
+  function wasmViewForSpectator() {
+    const rc = wasm.wasm_view_for_spectator();
+    if (rc !== 0) return null;
+    return JSON.parse(readWasmOut());
+  }
+
   function wasmPlayerIds() {
     const rc = wasm.wasm_player_ids();
     if (rc !== 0) return [];
     return JSON.parse(readWasmOut());
+  }
+
+  function saveHostSnapshot() {
+    if (!wasm || !isHostNode || !roomCode) return;
+    if (wasm.wasm_export_state() === 0) {
+      const json = readWasmOut();
+      sessionStorage.setItem("matsya_host_room", roomCode);
+      sessionStorage.setItem("matsya_host_snapshot", json);
+      localStorage.setItem("matsya_host_room", roomCode);
+      localStorage.setItem("matsya_host_snapshot", json);
+    }
+  }
+
+  function loadHostSnapshot(code) {
+    const ssRoom = sessionStorage.getItem("matsya_host_room");
+    const lsRoom = localStorage.getItem("matsya_host_room");
+    if (ssRoom === code && sessionStorage.getItem("matsya_host_snapshot")) {
+      return sessionStorage.getItem("matsya_host_snapshot");
+    }
+    if (lsRoom === code && localStorage.getItem("matsya_host_snapshot")) {
+      return localStorage.getItem("matsya_host_snapshot");
+    }
+    return null;
   }
 
   function topicHost(code) {
@@ -126,6 +167,14 @@
 
   function topicToPlayer(code, pid) {
     return `matsya/sabha/${code}/to/${pid}`;
+  }
+
+  function topicSpectator(code) {
+    return `matsya/sabha/${code}/spectator`;
+  }
+
+  function topicHeartbeat(code) {
+    return `matsya/sabha/${code}/heartbeat`;
   }
 
   function sendToGuest(pid, payload) {
@@ -138,6 +187,7 @@
   }
 
   function broadcastAllViews() {
+    saveHostSnapshot();
     const ids = wasmPlayerIds();
     for (const pid of ids) {
       const view = wasmViewForPlayer(pid);
@@ -148,14 +198,39 @@
         sendToGuest(pid, { type: "state", view });
       }
     }
+
+    const specView = wasmViewForSpectator();
+    if (specView) {
+      if (bc) {
+        bc.postMessage({ to: "spectator", type: "state", view: specView });
+      }
+      if (mqttClient && mqttClient.connected) {
+        mqttClient.publish(topicSpectator(roomCode), JSON.stringify({ type: "state", view: specView }), {
+          qos: 1,
+        });
+      }
+    }
   }
 
   function handleHostCommand(senderId, cmd) {
     if (cmd.type === "send_chat") {
       cmd = { ...cmd, timestamp_ms: Date.now() };
     }
+    const prevIds = wasmPlayerIds();
     const res = wasmDispatch(senderId, cmd);
     if (res.ok) {
+      if (cmd.type === "kick_player" && cmd.target_id) {
+        sendToGuest(cmd.target_id, {
+          type: "kicked",
+          message: "You were removed from the lobby by the host.",
+        });
+        guestTransports.delete(cmd.target_id);
+      } else if (prevIds.length > 0 && !wasmPlayerIds().includes(senderId)) {
+        sendToGuest(senderId, {
+          type: "kicked",
+          message: "You are no longer in this lobby.",
+        });
+      }
       broadcastAllViews();
     } else if (senderId === playerId) {
       showToast(res.out);
@@ -164,7 +239,32 @@
     }
   }
 
+  function handleSyncRequest(msg) {
+    if (msg.spectator) {
+      const specView = wasmViewForSpectator();
+      if (!specView) return;
+      if (bc) {
+        bc.postMessage({ to: "spectator", type: "state", view: specView });
+      }
+      if (mqttClient && mqttClient.connected) {
+        mqttClient.publish(topicSpectator(roomCode), JSON.stringify({ type: "state", view: specView }), {
+          qos: 1,
+        });
+      }
+      return;
+    }
+    const pid = msg.from;
+    if (!pid) return;
+    const view = wasmViewForPlayer(pid);
+    if (view) {
+      sendToGuest(pid, { type: "state", view });
+    } else {
+      sendToGuest(pid, { type: "kicked", message: "You are no longer in this room." });
+    }
+  }
+
   function applyStateView(view) {
+    lastSyncAt = Date.now();
     currentView = view;
     if (lastPhase !== currentView.phase) {
       selectedTeamIds.clear();
@@ -174,6 +274,10 @@
   }
 
   function sendCmd(cmd) {
+    if (isSpectator) {
+      showToast("Spectator mode is read-only.");
+      return;
+    }
     if (isHostNode) {
       handleHostCommand(playerId, cmd);
     } else if (hostTransport === "bc" && bc) {
@@ -184,6 +288,18 @@
       });
     } else {
       showToast("Connecting to Matsya Court host...");
+    }
+  }
+
+  function requestResync() {
+    if (isHostNode || !roomCode) return;
+    const payload = isSpectator
+      ? { type: "sync_request", spectator: true }
+      : { type: "sync_request", from: playerId };
+    if (hostTransport === "bc" && bc) {
+      bc.postMessage(payload);
+    } else if (mqttClient && mqttClient.connected) {
+      mqttClient.publish(topicHost(roomCode), JSON.stringify(payload), { qos: 0 });
     }
   }
 
@@ -200,8 +316,9 @@
 
   const MQTT_BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
 
-  async function startAsHost(code) {
+  async function startAsHost(code, restoreSnapshot = null) {
     isHostNode = true;
+    isSpectator = false;
     roomCode = code;
     roomCodeLabel.textContent = roomCode;
     copyLinkBtn.classList.remove("hidden");
@@ -210,16 +327,28 @@
     mainStage.innerHTML = `<div class="card"><h2>Opening King Virata's Sabha...</h2><p>Loading Rust WASM engine &amp; connecting court relay...</p></div>`;
 
     await loadWasm();
-    wasmInitRoom(roomCode);
-    wasmDispatch(playerId, { type: "join", player_id: playerId, display_name: displayName });
+    let restored = false;
+    if (restoreSnapshot) {
+      const s = writeWasmStr(restoreSnapshot);
+      const rc = wasm.wasm_import_state(s.ptr, s.len);
+      wasm.wasm_dealloc(s.ptr, s.len);
+      restored = rc === 0;
+    }
+    if (!restored) {
+      wasmInitRoom(roomCode);
+      wasmDispatch(playerId, { type: "join", player_id: playerId, display_name: displayName });
+    }
     broadcastAllViews();
 
-    // Same-browser tab fast-path
     if ("BroadcastChannel" in window) {
       bc = new BroadcastChannel(`matsya-sabha-${roomCode}`);
       bc.onmessage = (ev) => {
         const msg = ev.data;
         if (!msg || typeof msg !== "object" || msg.to) return;
+        if (msg.type === "sync_request") {
+          handleSyncRequest(msg);
+          return;
+        }
         if (msg.type === "join") {
           const pid = msg.player_id;
           const res = wasmDispatch(pid, {
@@ -239,7 +368,6 @@
       };
     }
 
-    // Cross-browser / cross-device MQTT over WSS
     mqttClient = mqtt.connect(MQTT_BROKER_URL, {
       clientId: `matsya_host_${roomCode}_${Math.random().toString(36).slice(2, 7)}`,
       clean: true,
@@ -249,7 +377,12 @@
     mqttClient.on("connect", () => {
       mqttClient.subscribe(topicHost(roomCode), { qos: 1 }, (err) => {
         if (!err) {
-          showToast(`Sabha ${roomCode} is open for all browsers & devices!`);
+          showToast(
+            restored
+              ? `Sabha ${roomCode} restored after refresh!`
+              : `Sabha ${roomCode} is open for all browsers & devices!`
+          );
+          broadcastAllViews();
         }
       });
     });
@@ -262,6 +395,11 @@
         return;
       }
       if (!msg || typeof msg !== "object") return;
+      if (msg.type === "sync_request") {
+        if (msg.from) guestTransports.set(msg.from, "mqtt");
+        handleSyncRequest(msg);
+        return;
+      }
       if (msg.type === "join") {
         const pid = msg.player_id;
         const res = wasmDispatch(pid, {
@@ -282,6 +420,7 @@
         return;
       }
       if (msg.from) {
+        guestTransports.set(msg.from, "mqtt");
         handleHostCommand(msg.from, msg);
       }
     });
@@ -289,18 +428,55 @@
     mqttClient.on("error", (err) => {
       showToast(`Court relay error: ${err.message || err}`);
     });
+
+    // 5-second lightweight heartbeat so guests/spectators detect any missed state update
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => {
+      if (!currentView) return;
+      const hb = { type: "heartbeat", version: currentView.state_version };
+      if (bc) bc.postMessage(hb);
+      if (mqttClient && mqttClient.connected) {
+        mqttClient.publish(topicHeartbeat(roomCode), JSON.stringify(hb), { qos: 0 });
+      }
+    }, 5000);
   }
 
-  function joinAsGuest(code) {
+  function resetToRoomGate(notice) {
+    clearTimeout(guestJoinTimer);
+    clearInterval(guestSyncTimer);
+    clearInterval(heartbeatTimer);
+    if (mqttClient) mqttClient.end(true);
+    if (bc) bc.close();
+    currentView = null;
+    hostTransport = null;
     isHostNode = false;
+    isSpectator = false;
+    roomCode = "";
+    window.history.replaceState({}, "", window.location.pathname);
+    copyLinkBtn.classList.add("hidden");
+    resetGameBtn.classList.add("hidden");
+    disguisePeekBtn.classList.add("hidden");
+    roomCodeLabel.textContent = "----";
+    mainStage.classList.remove("tv-stage");
+    if (notice) showToast(notice);
+    renderRoomGate();
+  }
+
+  function joinAsGuest(code, spectatorMode = false) {
+    isHostNode = false;
+    isSpectator = spectatorMode;
     roomCode = code;
     roomCodeLabel.textContent = roomCode;
+    gpgNameLabel.textContent = isSpectator ? "TV Spectator" : hasSetName ? displayName : "Guest";
     copyLinkBtn.classList.remove("hidden");
-    window.history.replaceState({}, "", `${window.location.pathname}?room=${encodeURIComponent(roomCode)}`);
+    mainStage.classList.toggle("tv-stage", isSpectator);
+
+    const qs = isSpectator ? `?room=${encodeURIComponent(roomCode)}&spectator=1` : `?room=${encodeURIComponent(roomCode)}`;
+    window.history.replaceState({}, "", `${window.location.pathname}${qs}`);
 
     mainStage.innerHTML = `
       <div class="card">
-        <h2>Joining Sabha ${escapeHtml(roomCode)}...</h2>
+        <h2>${isSpectator ? `Connecting TV Spectator to Sabha ${escapeHtml(roomCode)}...` : `Joining Sabha ${escapeHtml(roomCode)}...`}</h2>
         <p id="join-status-text">Connecting to host...</p>
         <div class="action-row">
           <button id="back-to-gate-btn" class="btn btn-secondary btn-sm" type="button">Back to Room Entry</button>
@@ -308,36 +484,41 @@
       </div>
     `;
     document.getElementById("back-to-gate-btn").addEventListener("click", () => {
-      clearTimeout(guestJoinTimer);
-      if (mqttClient) mqttClient.end(true);
-      if (bc) bc.close();
-      roomCode = "";
-      window.history.replaceState({}, "", window.location.pathname);
-      copyLinkBtn.classList.add("hidden");
-      roomCodeLabel.textContent = "----";
-      renderRoomGate();
+      resetToRoomGate();
     });
 
-    // Try instant same-browser BroadcastChannel first
+    const targetBcRecipient = isSpectator ? "spectator" : playerId;
     if ("BroadcastChannel" in window) {
       bc = new BroadcastChannel(`matsya-sabha-${roomCode}`);
       bc.onmessage = (ev) => {
         const msg = ev.data;
-        if (!msg || msg.to !== playerId) return;
+        if (!msg) return;
+        if (msg.type === "heartbeat") {
+          if (!currentView || msg.version !== currentView.state_version) {
+            requestResync();
+          }
+          return;
+        }
+        if (msg.to !== targetBcRecipient) return;
         if (msg.type === "state") {
           hostTransport = "bc";
           clearTimeout(guestJoinTimer);
           applyStateView(msg.view);
+        } else if (msg.type === "kicked") {
+          resetToRoomGate(msg.message);
         } else if (msg.type === "error") {
           showToast(msg.message);
         }
       };
-      bc.postMessage({ type: "join", player_id: playerId, display_name: displayName });
+      bc.postMessage(
+        isSpectator
+          ? { type: "sync_request", spectator: true }
+          : { type: "join", player_id: playerId, display_name: displayName }
+      );
     }
 
-    // Cross-browser / cross-device MQTT over WSS
     mqttClient = mqtt.connect(MQTT_BROKER_URL, {
-      clientId: `matsya_guest_${playerId}_${Math.random().toString(36).slice(2, 7)}`,
+      clientId: `matsya_${isSpectator ? "tv" : "guest"}_${playerId}_${Math.random().toString(36).slice(2, 7)}`,
       clean: true,
       reconnectPeriod: 2500,
     });
@@ -348,13 +529,12 @@
       attempts += 1;
       const statusEl = document.getElementById("join-status-text");
       if (statusEl) {
-        statusEl.textContent = `Joining room ${roomCode} (attempt ${attempts})...`;
+        statusEl.textContent = `Connecting to room ${roomCode} (attempt ${attempts})...`;
       }
-      mqttClient.publish(
-        topicHost(roomCode),
-        JSON.stringify({ type: "join", player_id: playerId, display_name: displayName }),
-        { qos: 1 }
-      );
+      const joinPayload = isSpectator
+        ? { type: "sync_request", spectator: true }
+        : { type: "join", player_id: playerId, display_name: displayName };
+      mqttClient.publish(topicHost(roomCode), JSON.stringify(joinPayload), { qos: 1 });
       if (attempts < 5) {
         guestJoinTimer = setTimeout(sendMqttJoin, 2500);
       } else {
@@ -365,16 +545,21 @@
       }
     };
 
+    const myTopic = isSpectator ? topicSpectator(roomCode) : topicToPlayer(roomCode, playerId);
     mqttClient.on("connect", () => {
       if (hostTransport === "bc") return;
-      mqttClient.subscribe(topicToPlayer(roomCode, playerId), { qos: 1 }, (err) => {
+      mqttClient.subscribe([myTopic, topicHeartbeat(roomCode)], { qos: 1 }, (err) => {
         if (!err) {
-          sendMqttJoin();
+          if (currentView) {
+            requestResync();
+          } else {
+            sendMqttJoin();
+          }
         }
       });
     });
 
-    mqttClient.on("message", (_topic, payload) => {
+    mqttClient.on("message", (topic, payload) => {
       if (hostTransport === "bc") return;
       let msg;
       try {
@@ -382,7 +567,15 @@
       } catch {
         return;
       }
-      if (msg.type === "error") {
+      if (topic === topicHeartbeat(roomCode) && msg.type === "heartbeat") {
+        if (!currentView || msg.version !== currentView.state_version) {
+          requestResync();
+        }
+        return;
+      }
+      if (msg.type === "kicked") {
+        resetToRoomGate(msg.message);
+      } else if (msg.type === "error") {
         showToast(msg.message);
       } else if (msg.type === "state") {
         hostTransport = "mqtt";
@@ -394,7 +587,24 @@
     mqttClient.on("error", (err) => {
       showToast(`Network error: ${err.message || err}`);
     });
+
+    // 5-second auto-sync fallback if no message/heartbeat received recently
+    clearInterval(guestSyncTimer);
+    guestSyncTimer = setInterval(() => {
+      if (currentView && Date.now() - lastSyncAt >= 5000) {
+        requestResync();
+      }
+    }, 5000);
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      requestResync();
+    }
+  });
+  window.addEventListener("focus", () => {
+    requestResync();
+  });
 
   copyLinkBtn.addEventListener("click", () => {
     const base = `${window.location.origin}${window.location.pathname}`;
@@ -406,6 +616,12 @@
   disguisePeekBtn.addEventListener("click", () => {
     peekingDisguise = !peekingDisguise;
     render();
+  });
+
+  resetGameBtn.addEventListener("click", () => {
+    if (window.confirm("Reset the current match and return all players to the lobby?")) {
+      sendCmd({ type: "reset_game" });
+    }
   });
 
   helpBtn.addEventListener("click", () => {
@@ -444,6 +660,10 @@
 
   chatForm.addEventListener("submit", (e) => {
     e.preventDefault();
+    if (isSpectator) {
+      showToast("Spectator mode cannot send chat messages.");
+      return;
+    }
     const text = chatInput.value.trim();
     if (!text) return;
     sendCmd({ type: "send_chat", text });
@@ -521,6 +741,7 @@
 
     return `
       <div class="card">
+        ${view.is_spectator ? '<div class="tv-badge">TV Spectator View &bull; Public Sabha Board</div>' : ""}
         <div class="battles-track">${items}</div>
         <div class="deadlock-bar">
           <div>
@@ -535,7 +756,7 @@
 
   function renderLobby(view) {
     const me = view.players.find((p) => p.id === view.self_id);
-    const isHost = me?.is_host;
+    const isHost = !view.is_spectator && me?.is_host;
     const count = view.players.length;
     const canStart = count >= 5 && count <= 10;
 
@@ -546,8 +767,13 @@
           <span class="player-name">${escapeHtml(p.display_name)}</span>
           <div style="display:flex; gap:5px; align-items:center;">
             ${p.is_host ? '<span class="tag tag-host">Host</span>' : ""}
-            ${p.id === view.self_id ? '<span class="tag tag-you">You</span>' : ""}
+            ${!view.is_spectator && p.id === view.self_id ? '<span class="tag tag-you">You</span>' : ""}
             ${!p.connected ? '<span class="tag tag-offline">Offline</span>' : ""}
+            ${
+              isHost && p.id !== view.self_id
+                ? `<button class="kick-btn" data-kick="${escapeHtml(p.id)}" type="button" title="Remove player">Remove</button>`
+                : ""
+            }
           </div>
         </div>
       `
@@ -556,7 +782,7 @@
 
     mainStage.innerHTML = `
       ${
-        !hasSetName
+        !view.is_spectator && !hasSetName
           ? `<div class="card needs-action">
               <div class="action-cue-badge">Your Action Required</div>
               <h2 class="screen-title">Welcome to Sabha ${escapeHtml(roomCode)}</h2>
@@ -568,8 +794,9 @@
             </div>`
           : ""
       }
-      <div class="card ${hasSetName && isHost && canStart ? "needs-action" : ""}">
-        ${hasSetName && isHost && canStart ? '<div class="action-cue-badge">Your Action Required</div>' : ""}
+      <div class="card ${!view.is_spectator && hasSetName && isHost && canStart ? "needs-action" : ""}">
+        ${view.is_spectator ? '<div class="tv-badge">TV Spectator Mode</div>' : ""}
+        ${!view.is_spectator && hasSetName && isHost && canStart ? '<div class="action-cue-badge">Your Action Required</div>' : ""}
         <h2 class="screen-title">Matsya Court Lobby</h2>
         <p class="screen-desc">
           Gather 5 to 10 courtiers in King Virata's Sabha. Share room code <strong>${escapeHtml(
@@ -578,7 +805,7 @@
         </p>
 
         ${
-          hasSetName
+          !view.is_spectator && hasSetName
             ? `<form id="gpg-form" class="profile-row">
                 <label for="gpg-input" style="font-size:0.9rem;"><strong>Your Name:</strong></label>
                 <input id="gpg-input" type="text" maxlength="24" value="${escapeHtml(displayName)}" />
@@ -600,20 +827,33 @@
       </div>
     `;
 
-    document.getElementById("gpg-form").addEventListener("submit", (e) => {
-      e.preventDefault();
-      const next = document.getElementById("gpg-input").value.trim();
-      if (!next) return;
-      displayName = next;
-      hasSetName = true;
-      sessionStorage.setItem("matsya_custom_name", displayName);
-      gpgNameLabel.textContent = displayName;
-      sendCmd({ type: "update_name", display_name: displayName });
-    });
+    const nameForm = document.getElementById("gpg-form");
+    if (nameForm) {
+      nameForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const next = document.getElementById("gpg-input").value.trim();
+        if (!next) return;
+        displayName = next;
+        hasSetName = true;
+        sessionStorage.setItem("matsya_custom_name", displayName);
+        localStorage.setItem("matsya_custom_name", displayName);
+        gpgNameLabel.textContent = displayName;
+        sendCmd({ type: "update_name", display_name: displayName });
+      });
+    }
 
     const beginBtn = document.getElementById("begin-council-btn");
     if (beginBtn) {
       beginBtn.addEventListener("click", () => sendCmd({ type: "start_game" }));
+    }
+
+    if (isHost) {
+      document.querySelectorAll(".kick-btn[data-kick]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const targetId = btn.getAttribute("data-kick");
+          sendCmd({ type: "kick_player", target_id: targetId });
+        });
+      });
     }
   }
 
@@ -665,7 +905,7 @@
 
   function renderCouncilProposal(view) {
     const battle = view.battles[view.current_battle_index];
-    const isLeader = view.leader_id === view.self_id;
+    const isLeader = !view.is_spectator && view.leader_id === view.self_id;
     const leader = view.players.find((p) => p.id === view.leader_id);
 
     const rosterHtml = view.players
@@ -676,7 +916,7 @@
           <div class="roster-tile ${isLeader ? "selectable" : ""} ${isSelected ? "selected" : ""}" data-pid="${escapeHtml(p.id)}">
             <div>
               <strong>${escapeHtml(p.display_name)}</strong>
-              ${p.id === view.self_id ? '<span class="tag tag-you" style="margin-left:6px;">You</span>' : ""}
+              ${!view.is_spectator && p.id === view.self_id ? '<span class="tag tag-you" style="margin-left:6px;">You</span>' : ""}
             </div>
             <div style="display:flex; align-items:center; gap:6px;">
               ${isLead ? '<img src="./assets/images/icon_royal_signet.png" class="signet-icon" title="Council Leader" />' : ""}
@@ -733,7 +973,7 @@
 
   function renderCourtVote(view) {
     const me = view.players.find((p) => p.id === view.self_id);
-    const hasVoted = me?.has_voted;
+    const hasVoted = view.is_spectator || me?.has_voted;
     const teamNames = view.proposed_team
       .map((id) => view.players.find((p) => p.id === id)?.display_name || id)
       .join(", ");
@@ -750,7 +990,9 @@
           Proposed Battle Team: <strong style="color: var(--gold);">${escapeHtml(teamNames)}</strong>
         </p>
         ${
-          hasVoted
+          view.is_spectator
+            ? `<div class="vision-box">Courtiers are voting in secret. <strong>${escapeHtml(waiting)}</strong></div>`
+            : hasVoted
             ? `<div class="vision-box">Your vote is locked in. <strong>${escapeHtml(waiting)}</strong></div>`
             : `<div class="action-row">
                 <button id="vote-yes-btn" class="btn btn-emerald">Approve (YES)</button>
@@ -773,7 +1015,7 @@
   function renderBallotReveal(view) {
     const b = view.ballot_results;
     const me = view.players.find((p) => p.id === view.self_id);
-    const canAdvance = view.leader_id === view.self_id || me?.is_host;
+    const canAdvance = !view.is_spectator && (view.leader_id === view.self_id || me?.is_host);
 
     const rows = b.entries
       .map(
@@ -819,7 +1061,7 @@
   function renderSecretBattle(view) {
     const battle = view.battles[view.current_battle_index];
     const progress = view.battle_progress;
-    const action = view.private_battle_action;
+    const action = view.is_spectator ? null : view.private_battle_action;
 
     let bodyHtml = "";
     if (action) {
@@ -886,7 +1128,7 @@
     const outcome = view.latest_battle_outcome;
     const battle = view.battles[view.current_battle_index];
     const me = view.players.find((p) => p.id === view.self_id);
-    const canAdvance = view.leader_id === view.self_id || me?.is_host;
+    const canAdvance = !view.is_spectator && (view.leader_id === view.self_id || me?.is_host);
 
     const cardsHtml = outcome.revealed_cards
       .map((c) => {
@@ -931,8 +1173,8 @@
   }
 
   function renderFinalUnmasking(view) {
-    const unmask = view.private_unmasking;
-    if (unmask.is_susharma) {
+    const unmask = view.is_spectator ? { is_susharma: false } : view.private_unmasking;
+    if (unmask && unmask.is_susharma) {
       const targetsHtml = unmask.targets
         .map(
           (t) => `
@@ -1014,7 +1256,7 @@
         </div>
         <div class="sandstone-grid">${rolesHtml}</div>
         ${
-          me?.is_host
+          !view.is_spectator && me?.is_host
             ? `<div style="text-align:center;">
                 <button id="play-again-btn" class="btn btn-gold">Play Again</button>
               </div>`
@@ -1034,16 +1276,23 @@
     renderChat(currentView.chat_messages || []);
 
     const me = currentView.players.find((p) => p.id === currentView.self_id);
-    if (me) {
+    if (currentView.is_spectator) {
+      gpgNameLabel.textContent = "TV Spectator";
+    } else if (me) {
       gpgNameLabel.textContent = me.display_name;
     }
 
     const showPeek =
+      !currentView.is_spectator &&
       currentView.phase !== "lobby" &&
       currentView.phase !== "victory" &&
       currentView.private_role &&
       currentView.private_role.acknowledged;
     disguisePeekBtn.classList.toggle("hidden", !showPeek);
+
+    const showReset =
+      !currentView.is_spectator && me?.is_host && currentView.phase !== "lobby";
+    resetGameBtn.classList.toggle("hidden", !showReset);
 
     if (currentView.phase === "lobby") {
       renderLobby(currentView);
@@ -1051,6 +1300,7 @@
     }
 
     if (
+      !currentView.is_spectator &&
       currentView.private_role &&
       (!currentView.private_role.acknowledged || peekingDisguise) &&
       currentView.phase !== "victory"
@@ -1104,7 +1354,10 @@
             <h3>Join Existing Court</h3>
             <p style="color:var(--text-muted); font-size:0.88rem;">Enter the 4-character room code:</p>
             <input id="room-code-input" class="room-code-input" type="text" maxlength="4" placeholder="ABCD" autocomplete="off" />
-            <button type="submit" class="btn btn-emerald">Join Room</button>
+            <div class="action-row" style="margin-top:4px;">
+              <button type="submit" class="btn btn-emerald" style="flex:1;">Join Room</button>
+              <button id="watch-tv-btn" type="button" class="btn btn-secondary" style="flex:1;">Watch on TV (Spectator)</button>
+            </div>
           </form>
         </div>
       </div>
@@ -1122,12 +1375,26 @@
         showToast("Please enter a valid 4-character room code.");
         return;
       }
-      joinAsGuest(code);
+      joinAsGuest(code, false);
+    });
+
+    document.getElementById("watch-tv-btn").addEventListener("click", () => {
+      const code = document.getElementById("room-code-input").value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+      if (code.length !== 4) {
+        showToast("Please enter a valid 4-character room code.");
+        return;
+      }
+      joinAsGuest(code, true);
     });
   }
 
   if (roomCode) {
-    joinAsGuest(roomCode);
+    const savedSnapshot = !isSpectator ? loadHostSnapshot(roomCode) : null;
+    if (savedSnapshot) {
+      startAsHost(roomCode, savedSnapshot);
+    } else {
+      joinAsGuest(roomCode, isSpectator);
+    }
   } else {
     renderRoomGate();
   }
